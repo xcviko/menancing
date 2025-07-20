@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Menancing Client - HH.ru Parser
 // @namespace    https://github.com/xcviko/menancing
-// @version      2.1.0
+// @version      2.2.0
 // @description  Автоматический парсинг вакансий с hh.ru
 // @author       xcviko
-// @match        https://hh.ru/search/vacancy*
+// @match        https://hh.ru/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -15,6 +15,8 @@
     const SERVER_URL = 'http://localhost:3000';
     const TARGET_LINKS = 300;
     let isParsingActive = false;
+    let isRespondingActive = false;
+    let currentVacancy = null;
     
     console.log('🚀 Menancing Parser v2.1 загружен');
 
@@ -122,12 +124,11 @@
         
         vacancyCards.forEach((card, index) => {
             const titleElement = card.querySelector('a[data-qa="serp-item__title"]');
-            const responseElement = card.querySelector('a[data-qa="vacancy-serp__vacancy_response"]');
             
-            if (titleElement && responseElement) {
+            if (titleElement && titleElement.href) {
                 links.push({
                     title: titleElement.textContent.trim(),
-                    url: responseElement.href
+                    url: titleElement.href
                 });
             }
         });
@@ -238,6 +239,7 @@
             
             if (newStats.completed) {
                 console.log('🎉 Цель достигнута! Парсинг завершён.');
+                isParsingActive = false; // Завершаем парсинг
                 showCompletionMessage();
                 return;
             }
@@ -246,6 +248,7 @@
             if (totalCards < config.targetCards || isLastPage()) {
                 console.log('🏁 Достигнута последняя страница или недостаточно вакансий');
                 console.log(`📊 Финальная статистика: ${newStats.total} ссылок собрано`);
+                isParsingActive = false; // Завершаем парсинг
                 showCompletionMessage(`Парсинг завершён! Собрано ${newStats.total} ссылок.`);
                 return;
             }
@@ -302,11 +305,195 @@
         }, 5000);
     }
 
+    // ============ АВТООТКЛИКИ ============
+    
+    // Новая функция для обработки вакансии, открытой из дашборда
+    async function processVacancyFromDashboard() {
+        console.log('🎯 Автообработка вакансии, открытой из дашборда');
+        
+        try {
+            // Получаем URL текущей страницы
+            const currentUrl = window.location.href;
+            
+            // Извлекаем ID вакансии из URL
+            const urlParts = currentUrl.match(/\/vacancy\/(\d+)/);
+            const vacancyId = urlParts ? urlParts[1] : null;
+            
+            if (!vacancyId) {
+                console.log('❌ Не удалось извлечь ID вакансии из URL');
+                window.close();
+                return;
+            }
+            
+            console.log('🔍 Ищем вакансию с ID:', vacancyId);
+            
+            // Ищем вакансию в базе по ID
+            const response = await fetch(`${SERVER_URL}/api/links`);
+            const data = await response.json();
+            
+            const vacancy = data.links.find(link => 
+                link.url.includes(`/vacancy/${vacancyId}`) || 
+                link.url.includes(vacancyId)
+            );
+            
+            if (!vacancy) {
+                console.log('❌ Вакансия не найдена в базе данных');
+                window.close();
+                return;
+            }
+            
+            console.log(`🎯 Обрабатываем вакансию: ${vacancy.title}`);
+            
+            // Ждём загрузки страницы и ищем кнопку "Откликнуться"
+            const responseButton = await waitForElement('a[data-qa="vacancy-response-link-top"]');
+            
+            if (!responseButton) {
+                console.log('❌ Кнопка "Откликнуться" не найдена');
+                await markVacancyAsFailed(vacancy.id, 'Кнопка не найдена');
+                window.close();
+                return;
+            }
+            
+            console.log('✓ Кнопка "Откликнуться" найдена, кликаем...');
+            responseButton.click();
+            
+            // Ждём появления сообщения об успешном отклике
+            await sleep(2000);
+            const successElement = Array.from(document.querySelectorAll('*')).find(el => 
+                el.textContent && el.textContent.replace(/[\s\u00A0]+/g, ' ').trim() === 'Вы откликнулись'
+            );
+            
+            if (successElement) {
+                console.log('🎉 Отклик отправлен успешно!');
+                // Синхронный запрос: пометить completed + открыть следующую
+                await fetch(`${SERVER_URL}/api/vacancy/completed-and-next`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ vacancyId: vacancy.id })
+                });
+            } else {
+                console.log('❌ Сообщение об успешном отклике не найдено');
+                await markVacancyAsFailed(vacancy.id, 'Отклик не подтвердился');
+            }
+            
+            // Закрываем вкладку
+            setTimeout(() => {
+                window.close();
+            }, 1000);
+            
+        } catch (error) {
+            console.error('❌ Ошибка автообработки:', error);
+            setTimeout(() => {
+                window.close();
+            }, 1000);
+        }
+    }
+    
+    // Получение следующей вакансии для обработки
+    async function getNextVacancy() {
+        try {
+            const response = await fetch(`${SERVER_URL}/api/next-vacancy`);
+            const data = await response.json();
+            return data.vacancy;
+        } catch (error) {
+            console.error('❌ Ошибка получения следующей вакансии:', error);
+            return null;
+        }
+    }
+    
+    // Отметить вакансию как "в обработке"
+    async function markVacancyAsProcessing(vacancyId) {
+        try {
+            await fetch(`${SERVER_URL}/api/vacancy/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ vacancyId })
+            });
+        } catch (error) {
+            console.error('❌ Ошибка отметки вакансии как processing:', error);
+        }
+    }
+    
+    // Отметить вакансию как "откликнулись"
+    async function markVacancyAsCompleted(vacancyId) {
+        try {
+            await fetch(`${SERVER_URL}/api/vacancy/complete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ vacancyId })
+            });
+            console.log('✅ Отклик отправлен успешно');
+        } catch (error) {
+            console.error('❌ Ошибка отметки вакансии как completed:', error);
+        }
+    }
+    
+    // Отметить вакансию как "ошибка"
+    async function markVacancyAsFailed(vacancyId, reason) {
+        try {
+            await fetch(`${SERVER_URL}/api/vacancy/failed`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ vacancyId, reason })
+            });
+            console.log('❌ Вакансия отмечена как проблемная:', reason);
+        } catch (error) {
+            console.error('❌ Ошибка отметки вакансии как failed:', error);
+        }
+    }
+    
+    // Ожидание появления элемента
+    async function waitForElement(selector, maxAttempts = 20) {
+        for (let i = 0; i < maxAttempts; i++) {
+            const element = document.querySelector(selector);
+            if (element) {
+                return element;
+            }
+            await sleep(500);
+        }
+        return null;
+    }
+    
+    // Обработка вакансии на её странице (только клик и проверка результата)
+    async function processVacancyOnPage(vacancy) {
+        console.log(`🎯 Обрабатываем вакансию на странице: ${vacancy.title}`);
+        
+        // Ждём загрузки страницы и ищем кнопку "Откликнуться"
+        const responseButton = await waitForElement('a[data-qa="vacancy-response-link-top"]');
+        
+        if (!responseButton) {
+            console.log('❌ Кнопка "Откликнуться" не найдена');
+            await markVacancyAsFailed(vacancy.id, 'Кнопка не найдена');
+            return false;
+        }
+        
+        console.log('✓ Кнопка "Откликнуться" найдена, кликаем...');
+        responseButton.click();
+        
+        // Ждём появления сообщения об успешном отклике
+        await sleep(2000); // Ждём обработки клика
+        const successElement = Array.from(document.querySelectorAll('*')).find(el => 
+            el.textContent && el.textContent.replace(/[\s\u00A0]+/g, ' ').trim() === 'Вы откликнулись'
+        );
+        
+        if (successElement) {
+            console.log('🎉 Отклик отправлен успешно!');
+            await markVacancyAsCompleted(vacancy.id);
+            return true;
+        } else {
+            console.log('❌ Сообщение об успешном отклике не найдено');
+            await markVacancyAsFailed(vacancy.id, 'Отклик не подтвердился');
+            return false;
+        }
+    }
+    
+    
     // Функции для ручного управления
     window.menancingStart = startAutoParsing;
     window.menancingParse = parseCurrentPage;
     window.menancingStats = getStats;
-    window.menancingScroll = scrollUntilAllCardsLoaded; // Новая функция для тестирования прокрутки
+    window.menancingScroll = scrollUntilAllCardsLoaded;
+    window.menancingProcessVacancy = processVacancyFromDashboard; // Ручная обработка вакансии
     window.menancingStop = () => {
         isParsingActive = false;
         console.log('⏹️ Парсинг остановлен');
@@ -345,20 +532,43 @@
 
     // Инициализация
     function init() {
-        console.log('✓ Парсер инициализирован для hh.ru');
-        console.log('📋 Доступные команды:');
-        console.log('- menancingStart() - запуск автопарсинга');
-        console.log('- menancingParse() - парсинг текущей страницы');
-        console.log('- menancingStats() - получение статистики');
-        console.log('- menancingScroll() - тест прокрутки lazy loading');
-        console.log('- menancingStop() - остановка парсинга');
+        const currentUrl = window.location.href;
+        const pathname = window.location.pathname;
         
-        // Автозапуск если включён
-        if (config.autoStart) {
-            setTimeout(() => {
-                console.log('🤖 Автозапуск через 3 секунды...');
-                setTimeout(startAutoParsing, 3000);
-            }, 1000);
+        console.log(`🚀 Menancing Client инициализирован на: ${pathname}`);
+        
+        if (pathname.includes('/search/vacancy') || currentUrl.includes('/search/vacancy')) {
+            // Страница поиска вакансий
+            console.log('✓ Парсер инициализирован для страницы поиска');
+            console.log('📋 Доступные команды:');
+            console.log('- menancingStart() - запуск автопарсинга');
+            console.log('- menancingParse() - парсинг текущей страницы');
+            console.log('- menancingStats() - получение статистики');
+            console.log('- menancingScroll() - тест прокрутки lazy loading');
+            console.log('- menancingStop() - остановка всех процессов');
+            
+            // Автозапуск парсинга если включён
+            if (config.autoStart) {
+                setTimeout(() => {
+                    console.log('🤖 Автозапуск парсинга через 3 секунды...');
+                    setTimeout(startAutoParsing, 3000);
+                }, 1000);
+            }
+        } else if (pathname.includes('/vacancy/') || currentUrl.includes('/vacancy/')) {
+            // Страница конкретной вакансии - автоматически обрабатываем
+            console.log('✓ Инициализирован для страницы вакансии - автообработка');
+            console.log('📍 URL:', currentUrl);
+            console.log('📍 Pathname:', pathname);
+            
+            setTimeout(async () => {
+                console.log('🎯 Запускаем автообработку вакансии...');
+                await processVacancyFromDashboard();
+            }, 2000);
+        } else {
+            console.log('✓ Скрипт загружен на поддерживаемом домене hh.ru');
+            console.log('📍 Путь:', pathname);
+            console.log('📋 Доступные команды:');
+            console.log('- menancingStop() - остановка всех процессов');
         }
     }
 
