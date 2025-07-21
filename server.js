@@ -6,6 +6,17 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Глобальные переменные для системы блокировки
+let isBlocked = false;
+let blockedSince = null;
+let retryTimeout = null;
+
+// Глобальная переменная для retry мониторинга
+let retryMonitoringInterval = null;
+
+// Глобальный Set для отслеживания открытых вкладок (используется для retry системы)
+let openedVacancyTabs = new Set();
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -31,6 +42,7 @@ db.serialize(() => {
     // Добавляем новые поля если таблица уже существует
     db.run(`ALTER TABLE vacancy_links ADD COLUMN response_status TEXT DEFAULT 'pending'`, () => {});
     db.run(`ALTER TABLE vacancy_links ADD COLUMN responded_at DATETIME`, () => {});
+    db.run(`ALTER TABLE vacancy_links ADD COLUMN is_being_tested INTEGER DEFAULT 0`, () => {});
 });
 
 // Главная страница с UI
@@ -140,6 +152,12 @@ app.get('/', (req, res) => {
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+            color: #2196F3;
+            text-decoration: none;
+        }
+        .link-title:hover {
+            color: #1976D2;
+            text-decoration: underline;
         }
         .loading {
             text-align: center;
@@ -152,6 +170,15 @@ app.get('/', (req, res) => {
     <div class="header">
         <h1>🚀 Menancing Parser Dashboard</h1>
         <p>Мониторинг парсинга вакансий с hh.ru</p>
+    </div>
+
+    <div id="blockingBanner" style="display: none; background: #E91E63; color: white; padding: 15px; margin-bottom: 20px; border-radius: 8px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+        <h3 style="margin: 0; font-size: 18px;">🚫 Система заблокирована (403)</h3>
+        <p style="margin: 5px 0 0 0; opacity: 0.9;">Автоматические отклики приостановлены. Система проверяет разблокировку каждую минуту.</p>
+        <div style="margin-top: 10px;">
+            <button class="btn" onclick="forceRetry()" style="background: #FF9800; color: white; margin-right: 10px;">⚡ Скипнуть минуту</button>
+            <button class="btn" onclick="clearBlocking()" style="background: white; color: #E91E63;">✅ Снять блокировку вручную</button>
+        </div>
     </div>
 
     <div class="stats">
@@ -189,6 +216,18 @@ app.get('/', (req, res) => {
         <div class="stat-card">
             <div class="stat-number" id="failedResponses" style="color: #f44336;">-</div>
             <div class="stat-label">Ошибки</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="quizResponses" style="color: #FF5722;">-</div>
+            <div class="stat-label">Требует квиз</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="coverLetterResponses" style="color: #9C27B0;">-</div>
+            <div class="stat-label">Требует письмо</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="blockedResponses" style="color: #E91E63;">-</div>
+            <div class="stat-label">Заблокировано</div>
         </div>
     </div>
 
@@ -252,6 +291,9 @@ app.get('/', (req, res) => {
                 document.getElementById('processingResponses').textContent = stats.processing;
                 document.getElementById('completedResponses').textContent = stats.completed;
                 document.getElementById('failedResponses').textContent = stats.failed;
+                document.getElementById('quizResponses').textContent = stats.requires_quiz;
+                document.getElementById('coverLetterResponses').textContent = stats.requires_cover_letter;
+                document.getElementById('blockedResponses').textContent = stats.blocked_403;
                 document.getElementById('responseProgressBar').style.width = stats.progress + '%';
                 
                 // Обновляем кнопку автооткликов
@@ -286,17 +328,23 @@ app.get('/', (req, res) => {
                         'pending': '#FF9800',
                         'processing': '#2196F3', 
                         'completed': '#4CAF50',
-                        'failed': '#f44336'
+                        'failed': '#f44336',
+                        'requires_quiz': '#FF5722',
+                        'requires_cover_letter': '#9C27B0',
+                        'blocked_403': '#E91E63'
                     };
                     const statusTexts = {
                         'pending': 'Ожидает',
                         'processing': 'В работе',
                         'completed': 'Откликнулись',
-                        'failed': 'Ошибка'
+                        'failed': 'Ошибка',
+                        'requires_quiz': 'Требует квиз',
+                        'requires_cover_letter': 'Требует письмо',
+                        'blocked_403': 'Заблокирован'
                     };
                     return '<tr>' +
                         '<td>' + (index + 1) + '</td>' +
-                        '<td class="link-title" title="' + (link.title || 'Без названия') + '">' + (link.title || 'Без названия') + '</td>' +
+                        '<td><a href="' + link.url + '" target="_blank" class="link-title" title="' + (link.title || 'Без названия') + '">' + (link.title || 'Без названия') + '</a></td>' +
                         '<td>' + (link.page_number !== null ? 'Стр. ' + (link.page_number + 1) : '-') + '</td>' +
                         '<td style="color: ' + (statusColors[link.response_status] || '#666') + '">' + (statusTexts[link.response_status] || link.response_status) + '</td>' +
                         '<td>' + new Date(link.created_at).toLocaleString('ru-RU') + '</td>' +
@@ -330,7 +378,7 @@ app.get('/', (req, res) => {
 
         let respondingInterval = null;
         let isRespondingActive = false;
-        let openedVacancyTabs = new Set(); // Отслеживаем открытые ID вакансий
+        let localOpenedVacancyTabs = new Set(); // Локальная копия для dashboard
 
         async function startAutoResponding() {
             if (isRespondingActive) {
@@ -375,7 +423,7 @@ app.get('/', (req, res) => {
                 }
 
                 // Проверяем, не открыта ли уже эта вакансия
-                if (openedVacancyTabs.has(data.vacancy.id)) {
+                if (localOpenedVacancyTabs.has(data.vacancy.id)) {
                     console.log('⏳ Вакансия уже обрабатывается...');
                     return true;
                 }
@@ -383,7 +431,16 @@ app.get('/', (req, res) => {
                 console.log('🔗 Открываем вакансию: ' + data.vacancy.title);
                 
                 // Добавляем в список открытых
-                openedVacancyTabs.add(data.vacancy.id);
+                localOpenedVacancyTabs.add(data.vacancy.id);
+                
+                // Синхронизируем с сервером для retry системы  
+                try {
+                    await fetch('/api/sync-opened-tabs', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'add', vacancyId: data.vacancy.id })
+                    });
+                } catch (e) { /* игнорируем ошибки синхронизации */ }
                 
                 // Открываем в новой вкладке
                 window.open(data.vacancy.url, '_blank');
@@ -427,14 +484,23 @@ app.get('/', (req, res) => {
                 
                 const processingVacancies = data.links.filter(link => 
                     link.response_status === 'processing' && 
-                    !openedVacancyTabs.has(link.id)
+                    !localOpenedVacancyTabs.has(link.id)
                 );
                 
                 // Открываем новые processing вакансии
                 processingVacancies.forEach(vacancy => {
-                    if (!openedVacancyTabs.has(vacancy.id)) {
+                    if (!localOpenedVacancyTabs.has(vacancy.id)) {
                         console.log('🔗 Автооткрытие новой processing вакансии:', vacancy.title);
-                        openedVacancyTabs.add(vacancy.id);
+                        localOpenedVacancyTabs.add(vacancy.id);
+                        
+                        // Синхронизируем с сервером для retry системы  
+                        try {
+                            fetch('/api/sync-opened-tabs', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ action: 'add', vacancyId: vacancy.id })
+                            });
+                        } catch (e) { /* игнорируем ошибки синхронизации */ }
                         window.open(vacancy.url, '_blank');
                     }
                 });
@@ -449,15 +515,138 @@ app.get('/', (req, res) => {
             }
             
             isRespondingActive = false;
-            openedVacancyTabs.clear(); // Очищаем список открытых вкладок
+            localOpenedVacancyTabs.clear(); // Очищаем список открытых вкладок
+            
+            // Синхронизируем очистку с сервером
+            try {
+                fetch('/api/sync-opened-tabs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'clear' })
+                });
+            } catch (e) { /* игнорируем ошибки синхронизации */ }
             document.getElementById('startRespondingBtn').style.display = 'inline-block';
             document.getElementById('stopRespondingBtn').style.display = 'none';
             
             console.log('⏹️ Автоотклики остановлены');
         }
 
+        async function fetchBlockingStatus() {
+            try {
+                const response = await fetch('/api/is-blocked');
+                const data = await response.json();
+                
+                const banner = document.getElementById('blockingBanner');
+                if (data.isBlocked) {
+                    banner.style.display = 'block';
+                } else {
+                    banner.style.display = 'none';
+                }
+                
+                return data;
+            } catch (error) {
+                console.error('Ошибка загрузки статуса блокировки:', error);
+            }
+        }
+
+        async function forceRetry() {
+            if (!confirm('Принудительно проверить разблокировку сейчас? Система попытается открыть заблокированную вакансию.')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/force-retry', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Retry проверка запущена! Система попытается открыть заблокированную вакансию.');
+                    refreshData();
+                    
+                    // Запускаем мониторинг новых processing вакансий для retry-тестов
+                    setTimeout(async () => {
+                        console.log('🔍 Проверяем появление новых processing вакансий после force-retry...');
+                        const response = await fetch('/api/links');
+                        const data = await response.json();
+                        
+                        console.log('📊 Всего вакансий в базе:', data.links.length);
+                        
+                        // Ищем все processing вакансии
+                        const allProcessingVacancies = data.links.filter(link => 
+                            link.response_status === 'processing'
+                        );
+                        console.log('📊 Всего processing вакансий:', allProcessingVacancies.length);
+                        
+                        // Показываем каждую processing вакансию
+                        allProcessingVacancies.forEach((vacancy, index) => {
+                            console.log('📋 Processing вакансия ' + (index + 1) + ':');
+                            console.log('   ID:', vacancy.id);
+                            console.log('   Title:', vacancy.title);
+                            console.log('   Status:', vacancy.response_status);
+                            console.log('   В localOpenedVacancyTabs:', localOpenedVacancyTabs.has(vacancy.id));
+                        });
+                        
+                        const newProcessingVacancies = allProcessingVacancies;
+                        
+                        console.log('📊 Найдено новых processing вакансий:', newProcessingVacancies.length);
+                        
+                        newProcessingVacancies.forEach(vacancy => {
+                            console.log('🔗 Автооткрытие retry-тест вакансии:', vacancy.title);
+                            console.log('🆔 ID вакансии:', vacancy.id);
+                            console.log('🔗 URL:', vacancy.url);
+                            
+                            // Удаляем из localOpenedVacancyTabs если была там ранее, затем добавляем заново
+                            localOpenedVacancyTabs.delete(vacancy.id);
+                            localOpenedVacancyTabs.add(vacancy.id);
+                            
+                            // Синхронизируем с сервером для retry системы  
+                            try {
+                                fetch('/api/sync-opened-tabs', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ action: 'delete', vacancyId: vacancy.id })
+                                });
+                                fetch('/api/sync-opened-tabs', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ action: 'add', vacancyId: vacancy.id })
+                                });
+                            } catch (e) { /* игнорируем ошибки синхронизации */ }
+                            
+                            window.open(vacancy.url, '_blank');
+                        });
+                    }, 2000); // Даем время серверу обновить статус
+                } else {
+                    alert('Ошибка: ' + result.message);
+                }
+            } catch (error) {
+                console.error('Ошибка принудительного retry:', error);
+                alert('Ошибка принудительного retry');
+            }
+        }
+
+        async function clearBlocking() {
+            if (!confirm('Снять блокировку системы? Автоотклики продолжатся.')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/clear-blocked', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Блокировка снята!');
+                    refreshData();
+                } else {
+                    alert('Ошибка снятия блокировки');
+                }
+            } catch (error) {
+                console.error('Ошибка снятия блокировки:', error);
+                alert('Ошибка снятия блокировки');
+            }
+        }
+
         async function refreshData() {
-            await Promise.all([fetchStats(), fetchResponseStats(), fetchLinks()]);
+            await Promise.all([fetchStats(), fetchResponseStats(), fetchLinks(), fetchBlockingStatus()]);
         }
 
         // Автообновление каждые 5 секунд
@@ -611,6 +800,96 @@ app.post('/api/vacancy/failed', (req, res) => {
     });
 });
 
+// Отметить вакансию как "требует сопроводительное письмо"
+app.post('/api/vacancy/requires-cover-letter', (req, res) => {
+    const { vacancyId } = req.body;
+    
+    if (!vacancyId) {
+        return res.status(400).json({ error: 'vacancyId обязателен' });
+    }
+    
+    db.run(`UPDATE vacancy_links SET response_status = 'requires_cover_letter' WHERE id = ?`, [vacancyId], (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        
+        console.log(`📝 Вакансия ID${vacancyId} отмечена как требующая сопроводительное письмо`);
+        
+        // Получаем следующую pending вакансию для продолжения процесса
+        db.get(`SELECT * FROM vacancy_links WHERE response_status = 'pending' ORDER BY id LIMIT 1`, (err, nextVacancy) => {
+            if (err) {
+                console.error('Ошибка получения следующей вакансии:', err);
+                return res.json({ success: true, message: 'Вакансия помечена как требующая сопр. письмо' });
+            }
+            
+            if (!nextVacancy) {
+                console.log('🎉 Больше нет pending вакансий для обработки!');
+                return res.json({ success: true, message: 'Вакансия помечена как требующая сопр. письмо, все остальные обработаны', allCompleted: true });
+            }
+            
+            // Помечаем следующую как processing для автоматического открытия
+            db.run(`UPDATE vacancy_links SET response_status = 'processing' WHERE id = ?`, [nextVacancy.id], (updateErr) => {
+                if (updateErr) {
+                    console.error('Ошибка обновления статуса следующей вакансии:', updateErr);
+                }
+                
+                console.log(`🔗 Подготавливаем следующую вакансию для автооткрытия: ${nextVacancy.title}`);
+                
+                res.json({ 
+                    success: true, 
+                    message: 'Вакансия помечена как требующая сопр. письмо, следующая будет открыта dashboard\'ом',
+                    shouldOpenNext: true
+                });
+            });
+        });
+    });
+});
+
+// Отметить вакансию как "требует квиз"
+app.post('/api/vacancy/requires-quiz', (req, res) => {
+    const { vacancyId } = req.body;
+    
+    if (!vacancyId) {
+        return res.status(400).json({ error: 'vacancyId обязателен' });
+    }
+    
+    db.run(`UPDATE vacancy_links SET response_status = 'requires_quiz' WHERE id = ?`, [vacancyId], (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        
+        console.log(`📝 Вакансия ID${vacancyId} отмечена как требующая квиз`);
+        
+        // Получаем следующую pending вакансию для продолжения процесса
+        db.get(`SELECT * FROM vacancy_links WHERE response_status = 'pending' ORDER BY id LIMIT 1`, (err, nextVacancy) => {
+            if (err) {
+                console.error('Ошибка получения следующей вакансии:', err);
+                return res.json({ success: true, message: 'Вакансия помечена как требующая квиз' });
+            }
+            
+            if (!nextVacancy) {
+                console.log('🎉 Больше нет pending вакансий для обработки!');
+                return res.json({ success: true, message: 'Вакансия помечена как требующая квиз, все остальные обработаны', allCompleted: true });
+            }
+            
+            // Помечаем следующую как processing для автоматического открытия
+            db.run(`UPDATE vacancy_links SET response_status = 'processing' WHERE id = ?`, [nextVacancy.id], (updateErr) => {
+                if (updateErr) {
+                    console.error('Ошибка обновления статуса следующей вакансии:', updateErr);
+                }
+                
+                console.log(`🔗 Подготавливаем следующую вакансию для автооткрытия: ${nextVacancy.title}`);
+                
+                res.json({ 
+                    success: true, 
+                    message: 'Вакансия помечена как требующая квиз, следующая будет открыта dashboard\'ом',
+                    shouldOpenNext: true
+                });
+            });
+        });
+    });
+});
+
 // Синхронный endpoint: пометить как completed + открыть следующую вакансию
 app.post('/api/vacancy/completed-and-next', (req, res) => {
     const { vacancyId } = req.body;
@@ -626,6 +905,22 @@ app.post('/api/vacancy/completed-and-next', (req, res) => {
         }
         
         console.log(`✅ Вакансия ID${vacancyId} отмечена как completed`);
+        
+        // Если система была заблокирована и успешно обработали вакансию - снимаем блокировку
+        if (isBlocked) {
+            console.log('🎉 РАЗБЛОКИРОВКА: Успешный отклик во время блокировки!');
+            console.log('📊 Снимаем глобальную блокировку системы');
+            isBlocked = false;
+            blockedSince = null;
+            if (retryTimeout) {
+                console.log('⏰ Отменяем retry timeout');
+                clearTimeout(retryTimeout);
+                retryTimeout = null;
+            }
+            console.log('✅ Система полностью разблокирована');
+        } else {
+            console.log('📊 Система не была заблокирована, продолжаем обычную работу');
+        }
         
         // Получаем следующую pending вакансию
         db.get(`SELECT * FROM vacancy_links WHERE response_status = 'pending' ORDER BY id LIMIT 1`, (err, nextVacancy) => {
@@ -676,7 +971,10 @@ app.get('/api/response-stats', (req, res) => {
             pending: 0,
             processing: 0,
             completed: 0,
-            failed: 0
+            failed: 0,
+            requires_quiz: 0,
+            requires_cover_letter: 0,
+            blocked_403: 0
         };
         
         rows.forEach(row => {
@@ -702,6 +1000,412 @@ app.delete('/api/links', (req, res) => {
             return res.status(500).json({ error: err.message });
         }
         res.json({ success: true, message: 'База данных очищена' });
+    });
+});
+
+// ============ СИСТЕМА RETRY ДЛЯ БЛОКИРОВКИ ============
+
+function startRetrySystem() {
+    console.log('🔄 === ЗАПУСК RETRY СИСТЕМЫ ===');
+    console.log('📊 Текущее состояние системы:');
+    console.log('   - isBlocked:', isBlocked);
+    console.log('   - blockedSince:', blockedSince);
+    console.log('   - retryTimeout существует:', !!retryTimeout);
+    
+    if (retryTimeout) {
+        console.log('⏰ Отменяем предыдущий timeout');
+        clearTimeout(retryTimeout);
+        retryTimeout = null;
+    }
+    
+    console.log('⏰ Устанавливаем новый timeout на 60 секунд...');
+    console.log('📅 Следующая проверка в:', new Date(Date.now() + 60000).toLocaleTimeString());
+    retryTimeout = setTimeout(async () => {
+        console.log('🔔 TIMEOUT СРАБОТАЛ - начинаем retry проверку');
+        console.log('📅 Время срабатывания:', new Date().toLocaleTimeString());
+        
+        if (!isBlocked) {
+            console.log('✅ Система больше не заблокирована, выходим из retry');
+            return; // Блокировка была снята
+        }
+        
+        console.log('🔄 Система все еще заблокирована, ищем вакансию для проверки...');
+        
+        // Получаем одну заблокированную вакансию
+        console.log('📊 Ищем заблокированные вакансии в базе...');
+        db.get(`SELECT * FROM vacancy_links WHERE response_status = 'blocked_403' ORDER BY id LIMIT 1`, (err, blockedVacancy) => {
+            if (err) {
+                console.error('❌ Ошибка получения заблокированной вакансии:', err);
+                console.log('🔄 Перезапускаем retry систему из-за ошибки');
+                startRetrySystem(); // Повторяем через минуту
+                return;
+            }
+            
+            if (!blockedVacancy) {
+                console.log('⚠️ Нет заблокированных вакансий для тестирования');
+                console.log('🔄 Но система все еще заблокирована - тестируем через обычную pending вакансию');
+                
+                // Если нет blocked_403, берем любую pending вакансию для теста
+                db.get(`SELECT * FROM vacancy_links WHERE response_status = 'pending' ORDER BY id LIMIT 1`, (err2, pendingVacancy) => {
+                    if (err2) {
+                        console.error('❌ Ошибка получения pending вакансии:', err2);
+                        startRetrySystem();
+                        return;
+                    }
+                    
+                    if (!pendingVacancy) {
+                        console.log('⚠️ Нет и pending вакансий - перезапускаем retry');
+                        startRetrySystem();
+                        return;
+                    }
+                    
+                    console.log(`🔗 Используем pending вакансию для теста: ${pendingVacancy.title}`);
+                    
+                    // Помечаем как тестируемую БЕЗ изменения статуса
+                    db.run(`UPDATE vacancy_links SET is_being_tested = 1 WHERE id = ?`, [pendingVacancy.id], (updateErr) => {
+                        if (updateErr) {
+                            console.error('❌ Ошибка установки флага тестирования:', updateErr);
+                        } else {
+                            console.log('✅ Pending вакансия помечена как тестируемая (is_being_tested = 1)');
+                        }
+                        
+                        console.log('🚀 Запускаем retry мониторинг для открытия тестируемой вакансии');
+                        
+                        // Запускаем retry мониторинг если он не активен
+                        if (!retryMonitoringInterval) {
+                            startRetryTabMonitoring();
+                        }
+                        
+                        // Fallback больше не нужен - retry мониторинг работает независимо
+                    });
+                });
+                return;
+            }
+            
+            console.log(`🔗 Найдена заблокированная вакансия для теста: ${blockedVacancy.title}`);
+            console.log('🆔 ID вакансии:', blockedVacancy.id);
+            console.log('📊 Текущий статус:', blockedVacancy.response_status);
+            
+            // Помечаем как тестируемую БЕЗ изменения статуса
+            console.log('📝 Помечаем заблокированную вакансию как тестируемую...');
+            db.run(`UPDATE vacancy_links SET is_being_tested = 1 WHERE id = ?`, [blockedVacancy.id], (updateErr) => {
+                if (updateErr) {
+                    console.error('❌ Ошибка установки флага тестирования:', updateErr);
+                } else {
+                    console.log('✅ Заблокированная вакансия помечена как тестируемая (is_being_tested = 1)');
+                    console.log('📊 Статус остается blocked_403, счетчик НЕ изменяется');
+                }
+                
+                console.log('🚀 Запускаем retry мониторинг для открытия тестируемой вакансии');
+                
+                // Запускаем retry мониторинг если он не активен
+                if (!retryMonitoringInterval) {
+                    startRetryTabMonitoring();
+                }
+                
+                console.log('🔄 НЕ перезапускаем retry - ждем результата обработки');
+                
+                // Fallback больше не нужен - retry мониторинг работает независимо
+            });
+        });
+        
+    }, 60000); // 60 секунд
+    
+    console.log('⏰ Timeout установлен на 60 секунд, ожидаем...');
+}
+
+// Независимый мониторинг для retry тестирования
+function startRetryTabMonitoring() {
+    console.log('🔄 === ЗАПУСК RETRY МОНИТОРИНГА ===');
+    
+    if (retryMonitoringInterval) {
+        console.log('⏰ Отменяем предыдущий retry мониторинг');
+        clearInterval(retryMonitoringInterval);
+        retryMonitoringInterval = null;
+    }
+    
+    console.log('🔍 Запускаем независимый мониторинг тестируемых вакансий...');
+    
+    retryMonitoringInterval = setInterval(() => {
+        if (!isBlocked) {
+            console.log('✅ Система разблокирована - останавливаем retry мониторинг');
+            stopRetryTabMonitoring();
+            return;
+        }
+        
+        // Ищем тестируемые вакансии (с флагом is_being_tested = 1)
+        db.all(`SELECT * FROM vacancy_links WHERE is_being_tested = 1`, (err, testingVacancies) => {
+            if (err) {
+                console.error('❌ Ошибка получения тестируемых вакансий:', err);
+                return;
+            }
+            
+            if (testingVacancies.length === 0) {
+                return; // Нет тестируемых вакансий
+            }
+            
+            console.log(`🔍 Найдено ${testingVacancies.length} тестируемых вакансий`);
+            
+            testingVacancies.forEach(vacancy => {
+                console.log(`🚀 Открываем тестируемую вакансию: ${vacancy.title} (ID: ${vacancy.id})`);
+                
+                // СРАЗУ сбрасываем флаг чтобы предотвратить повторные открытия
+                db.run(`UPDATE vacancy_links SET is_being_tested = 0 WHERE id = ?`, [vacancy.id], (err) => {
+                    if (err) {
+                        console.error('❌ Ошибка сброса флага:', err);
+                    } else {
+                        console.log(`✅ Флаг is_being_tested сброшен для вакансии ID: ${vacancy.id}`);
+                    }
+                });
+                
+                // Временно возвращаемся к простому методу - меняем статус на processing
+                db.run(`UPDATE vacancy_links SET response_status = 'processing' WHERE id = ?`, [vacancy.id], (err) => {
+                    if (err) {
+                        console.error('❌ Ошибка изменения статуса на processing:', err);
+                    } else {
+                        console.log(`✅ Вакансия ID: ${vacancy.id} изменена на processing для открытия dashboard'ом`);
+                    }
+                });
+            });
+        });
+        
+    }, 2000); // Проверяем каждые 2 секунды
+}
+
+function stopRetryTabMonitoring() {
+    if (retryMonitoringInterval) {
+        console.log('⏹️ Остановка retry мониторинга');
+        clearInterval(retryMonitoringInterval);
+        retryMonitoringInterval = null;
+    }
+}
+
+// ============ ENDPOINTS ДЛЯ БЛОКИРОВКИ ============
+
+// Отметить вакансию как заблокированную (403)
+app.post('/api/vacancy/blocked', (req, res) => {
+    const { vacancyId } = req.body;
+    
+    if (!vacancyId) {
+        return res.status(400).json({ error: 'vacancyId обязателен' });
+    }
+    
+    db.run(`UPDATE vacancy_links SET response_status = 'blocked_403' WHERE id = ?`, [vacancyId], (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        
+        console.log(`🚫 Вакансия ID${vacancyId} отмечена как заблокированная (403)`);
+        
+        // Если система заблокирована и это был retry тест - перезапускаем retry
+        if (isBlocked) {
+            console.log('🔄 Retry тест неудачен - тестовая вакансия тоже заблокирована');
+            console.log('⏰ Перезапускаем retry систему на следующую минуту');
+            startRetrySystem();
+        }
+        
+        res.json({ success: true, message: 'Вакансия отмечена как заблокированная' });
+    });
+});
+
+// Проверить статус глобальной блокировки
+app.get('/api/is-blocked', (req, res) => {
+    res.json({ 
+        isBlocked,
+        blockedSince,
+        nextRetry: retryTimeout ? new Date(Date.now() + 60000) : null
+    });
+});
+
+// Установить глобальную блокировку
+app.post('/api/set-blocked', (req, res) => {
+    isBlocked = true;
+    blockedSince = new Date();
+    
+    console.log(`🚫 Система заблокирована в ${blockedSince.toLocaleString()}`);
+    
+    // Запускаем систему retry
+    startRetrySystem();
+    
+    // Запускаем независимый retry мониторинг
+    startRetryTabMonitoring();
+    
+    res.json({ success: true, message: 'Система заблокирована, запущена система retry' });
+});
+
+// Снять глобальную блокировку вручную
+app.post('/api/clear-blocked', (req, res) => {
+    isBlocked = false;
+    blockedSince = null;
+    
+    if (retryTimeout) {
+        clearTimeout(retryTimeout);
+        retryTimeout = null;
+    }
+    
+    // Останавливаем retry мониторинг
+    stopRetryTabMonitoring();
+    
+    // Сбрасываем все флаги тестирования
+    db.run(`UPDATE vacancy_links SET is_being_tested = 0 WHERE is_being_tested = 1`, (err) => {
+        if (err) {
+            console.error('❌ Ошибка сброса флагов тестирования:', err);
+        } else {
+            console.log('✅ Все флаги тестирования сброшены');
+        }
+    });
+    
+    console.log('✅ Блокировка снята вручную');
+    res.json({ success: true, message: 'Блокировка снята' });
+});
+
+// Принудительный запуск retry проверки (скипнуть минуту ожидания)
+app.post('/api/force-retry', (req, res) => {
+    console.log('🔔 === FORCE-RETRY ENDPOINT ВЫЗВАН ===');
+    console.log('📊 Текущее состояние системы:');
+    console.log('   - isBlocked:', isBlocked);
+    console.log('   - blockedSince:', blockedSince);
+    console.log('   - retryTimeout существует:', !!retryTimeout);
+    
+    if (!isBlocked) {
+        console.log('❌ ВЫХОД: Система не заблокирована');
+        return res.json({ success: false, message: 'Система не заблокирована' });
+    }
+    
+    console.log('⚡ Принудительный запуск retry проверки...');
+    
+    // Отменяем текущий таймер
+    if (retryTimeout) {
+        clearTimeout(retryTimeout);
+        retryTimeout = null;
+    }
+    
+    // Запускаем проверку сразу
+    setTimeout(() => {
+        if (!isBlocked) {
+            return; // Блокировка была снята
+        }
+        
+        console.log('🔄 Принудительная проверка заблокированной вакансии...');
+        
+        // Получаем одну заблокированную вакансию
+        db.get(`SELECT * FROM vacancy_links WHERE response_status = 'blocked_403' ORDER BY id LIMIT 1`, (err, blockedVacancy) => {
+            if (err) {
+                console.error('Ошибка получения заблокированной вакансии:', err);
+                startRetrySystem(); // Возвращаемся к обычному ритму
+                return;
+            }
+            
+            if (!blockedVacancy) {
+                console.log('⚠️ Нет заблокированных вакансий для тестирования');
+                startRetrySystem(); // Возвращаемся к обычному ритму
+                return;
+            }
+            
+            console.log(`🔗 Принудительно тестируем заблокированную вакансию: ${blockedVacancy.title}`);
+            console.log('🆔 ID для обновления:', blockedVacancy.id);
+            
+            // Помечаем как тестируемую БЕЗ изменения статуса
+            console.log('📝 FORCE-RETRY: Помечаем вакансию как тестируемую...');
+            db.run(`UPDATE vacancy_links SET is_being_tested = 1 WHERE id = ?`, [blockedVacancy.id], function(updateErr) {
+                if (updateErr) {
+                    console.error('❌ FORCE-RETRY: Ошибка установки флага тестирования:', updateErr);
+                } else {
+                    console.log('✅ FORCE-RETRY: Вакансия помечена как тестируемая (is_being_tested = 1)');
+                    console.log('📊 FORCE-RETRY: Статус остается blocked_403, счетчик НЕ изменяется');
+                    console.log('📊 FORCE-RETRY: Количество затронутых строк:', this.changes);
+                }
+                
+                console.log('🚀 FORCE-RETRY: Запускаем retry мониторинг для открытия тестируемой вакансии');
+                
+                // Запускаем retry мониторинг если он не активен
+                if (!retryMonitoringInterval) {
+                    startRetryTabMonitoring();
+                }
+                
+                console.log('⏰ FORCE-RETRY: Ожидаем результата обработки перед перезапуском retry');
+            });
+        });
+        
+    }, 1000); // Задержка 1 секунда для UI
+    
+    res.json({ success: true, message: 'Retry проверка запущена принудительно' });
+});
+
+// API для синхронизации открытых вкладок
+app.post('/api/sync-opened-tabs', (req, res) => {
+    const { action, vacancyId } = req.body;
+    
+    if (action === 'add') {
+        openedVacancyTabs.add(vacancyId);
+    } else if (action === 'delete') {
+        openedVacancyTabs.delete(vacancyId);
+    } else if (action === 'clear') {
+        openedVacancyTabs.clear();
+    }
+    
+    res.json({ success: true });
+});
+
+// Endpoint для тестирования заблокированных вакансий
+app.post('/test-vacancy', (req, res) => {
+    const { vacancyId, url, title } = req.body;
+    
+    console.log(`🧪 RETRY TEST: Получен запрос на тестирование вакансии ${title} (ID: ${vacancyId})`);
+    
+    // Отправляем HTML страницу которая откроет вакансию в новой вкладке
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Retry Test - ${title}</title>
+    <script>
+        console.log('🧪 RETRY TEST: Открываем тестовую вакансию');
+        window.open('${url}', '_blank');
+        
+        // Через 3 секунды закрываем эту служебную вкладку
+        setTimeout(() => {
+            console.log('🧪 RETRY TEST: Закрываем служебную вкладку');
+            window.close();
+        }, 3000);
+    </script>
+</head>
+<body>
+    <h3>🧪 Retry Test</h3>
+    <p>Тестируем вакансию: <strong>${title}</strong></p>
+    <p>ID: ${vacancyId}</p>
+    <p>Вакансия открывается в новой вкладке...</p>
+    <script>
+        // Убираем флаг тестирования через 30 секунд если ничего не произошло
+        setTimeout(() => {
+            fetch('/api/clear-retry-test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ vacancyId: ${vacancyId} })
+            }).then(() => {
+                console.log('🧪 RETRY TEST: Флаг тестирования сброшен по таймауту');
+            }).catch(err => {
+                console.error('❌ Ошибка сброса флага тестирования:', err);
+            });
+        }, 30000);
+    </script>
+</body>
+</html>
+    `);
+});
+
+// Сброс флага тестирования
+app.post('/api/clear-retry-test', (req, res) => {
+    const { vacancyId } = req.body;
+    
+    db.run(`UPDATE vacancy_links SET is_being_tested = 0 WHERE id = ?`, [vacancyId], (err) => {
+        if (err) {
+            console.error('❌ Ошибка сброса флага тестирования:', err);
+            return res.json({ success: false, error: err.message });
+        }
+        
+        console.log(`✅ Флаг тестирования сброшен для вакансии ID: ${vacancyId}`);
+        res.json({ success: true });
     });
 });
 
