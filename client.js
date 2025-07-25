@@ -5,6 +5,9 @@
 // @description  Автоматический парсинг вакансий с hh.ru
 // @author       xcviko
 // @match        https://hh.ru/*
+// @updateURL    https://raw.githubusercontent.com/xcviko/menancing/main/client.js
+// @downloadURL  https://raw.githubusercontent.com/xcviko/menancing/main/client.js
+// @homepageURL  https://github.com/xcviko/menancing
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
