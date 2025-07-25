@@ -248,6 +248,10 @@ app.get('/', (req, res) => {
             <div class="stat-number" id="blockedResponses" style="color: #E91E63;">-</div>
             <div class="stat-label">Заблокировано</div>
         </div>
+        <div class="stat-card">
+            <div class="stat-number" id="unavailableResponses" style="color: #9E9E9E;">-</div>
+            <div class="stat-label">Недоступно</div>
+        </div>
     </div>
 
     <div class="progress-bar">
@@ -313,6 +317,7 @@ app.get('/', (req, res) => {
                 document.getElementById('quizResponses').textContent = stats.requires_quiz;
                 document.getElementById('coverLetterResponses').textContent = stats.requires_cover_letter;
                 document.getElementById('blockedResponses').textContent = stats.blocked_403;
+                document.getElementById('unavailableResponses').textContent = stats.unavailable;
                 document.getElementById('responseProgressBar').style.width = stats.progress + '%';
                 
                 // Обновляем кнопку автооткликов
@@ -350,7 +355,8 @@ app.get('/', (req, res) => {
                         'failed': '#f44336',
                         'requires_quiz': '#FF5722',
                         'requires_cover_letter': '#9C27B0',
-                        'blocked_403': '#E91E63'
+                        'blocked_403': '#E91E63',
+                        'unavailable': '#9E9E9E'
                     };
                     const statusTexts = {
                         'pending': 'Ожидает',
@@ -359,7 +365,8 @@ app.get('/', (req, res) => {
                         'failed': 'Ошибка',
                         'requires_quiz': 'Требует квиз',
                         'requires_cover_letter': 'Требует письмо',
-                        'blocked_403': 'Заблокирован'
+                        'blocked_403': 'Заблокирован',
+                        'unavailable': 'Недоступна'
                     };
                     return '<tr>' +
                         '<td>' + (index + 1) + '</td>' +
@@ -810,6 +817,51 @@ app.post('/api/vacancy/requires-quiz', (req, res) => {
     });
 });
 
+// Отметить вакансию как "недоступна" (скрыта создателем)
+app.post('/api/vacancy/unavailable', (req, res) => {
+    const { vacancyId } = req.body;
+    
+    if (!vacancyId) {
+        return res.status(400).json({ error: 'vacancyId обязателен' });
+    }
+    
+    db.run(`UPDATE vacancy_links SET response_status = 'unavailable' WHERE id = ?`, [vacancyId], (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        
+        console.log(`🚫 Вакансия ID${vacancyId} отмечена как недоступная`);
+        
+        // Получаем следующую pending вакансию для продолжения процесса
+        db.get(`SELECT * FROM vacancy_links WHERE response_status = 'pending' ORDER BY id LIMIT 1`, (err, nextVacancy) => {
+            if (err) {
+                console.error('Ошибка получения следующей вакансии:', err);
+                return res.json({ success: true, message: 'Вакансия помечена как недоступная' });
+            }
+            
+            if (!nextVacancy) {
+                console.log('🎉 Больше нет pending вакансий для обработки!');
+                return res.json({ success: true, message: 'Вакансия помечена как недоступная, все остальные обработаны', allCompleted: true });
+            }
+            
+            // Помечаем следующую как processing для автоматического открытия
+            db.run(`UPDATE vacancy_links SET response_status = 'processing' WHERE id = ?`, [nextVacancy.id], (updateErr) => {
+                if (updateErr) {
+                    console.error('Ошибка обновления статуса следующей вакансии:', updateErr);
+                }
+                
+                console.log(`🔗 Подготавливаем следующую вакансию для автооткрытия: ${nextVacancy.title}`);
+                
+                res.json({ 
+                    success: true, 
+                    message: 'Вакансия помечена как недоступная, следующая будет открыта dashboard\'ом',
+                    shouldOpenNext: true
+                });
+            });
+        });
+    });
+});
+
 // Синхронный endpoint: пометить как completed + открыть следующую вакансию
 app.post('/api/vacancy/completed-and-next', (req, res) => {
     const { vacancyId } = req.body;
@@ -889,7 +941,8 @@ app.get('/api/response-stats', (req, res) => {
             failed: 0,
             requires_quiz: 0,
             requires_cover_letter: 0,
-            blocked_403: 0
+            blocked_403: 0,
+            unavailable: 0
         };
         
         rows.forEach(row => {
