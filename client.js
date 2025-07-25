@@ -656,17 +656,6 @@
             if (result === 'success') {
                 console.log('🎉 Отклик отправлен успешно!');
                 
-                // ВАЖНО: Сбрасываем флаг тестирования если это retry тест
-                try {
-                    await fetch(`${SERVER_URL}/api/clear-retry-test`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ vacancyId: vacancy.id })
-                    });
-                    console.log('✅ Флаг retry тестирования сброшен');
-                } catch (err) {
-                    console.log('⚠️ Ошибка сброса флага тестирования (не критично):', err);
-                }
                 
                 // Синхронный запрос: пометить completed + открыть следующую
                 await fetch(`${SERVER_URL}/api/vacancy/completed-and-next`, {
