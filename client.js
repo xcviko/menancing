@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Menancing Client - HH.ru Parser
 // @namespace    https://github.com/xcviko/menancing
-// @version      2.2.0
+// @version      2.2.1
 // @description  Автоматический парсинг вакансий с hh.ru
 // @author       xcviko
 // @match        https://hh.ru/*
